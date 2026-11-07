@@ -20,24 +20,31 @@
     "ee"  :ee
     nil   :oss))
 
-(defn- build-frontend! [edition]
+(defn- build-frontend!
+  "Build the frontend. `before-js` runs after the ClojureScript build and before the JavaScript build, which is the
+  first part that reads the output of `:translations`."
+  [edition {:keys [before-js]}]
   {:pre [(#{:oss :ee} edition)]}
   (let [mb-edition (case edition
                      :ee "ee"
-                     :oss "oss")]
+                     :oss "oss")
+        env        {"PATH"                (env/env :path)
+                    "HOME"                (env/env :user-home)
+                    "WEBPACK_BUNDLE"      "production"
+                    "MB_EDITION"          mb-edition
+                    "EMIT_BUNDLE_STATS"   (or (env/env :emit-bundle-stats) "false")
+                    "INSTRUMENT_COVERAGE" (or (env/env :instrument-coverage) "false")}]
     (u/step (format "Build frontend with MB_EDITION=%s" mb-edition)
       (when-not (env/env :ci)
         (u/step "Run 'bun install' to download JavaScript dependencies"
           (u/sh {:dir u/project-root-directory} "bun" "install")))
+      ;; `bun run build-release`, in two parts
+      (u/step "Build ClojureScript"
+        (u/sh {:dir u/project-root-directory, :env env} "bun" "run" "build-release:cljs"))
+      (when before-js
+        (before-js))
       (u/step "Build frontend"
-        (u/sh {:dir u/project-root-directory
-               :env {"PATH"       (env/env :path)
-                     "HOME"       (env/env :user-home)
-                     "WEBPACK_BUNDLE"   "production"
-                     "MB_EDITION" mb-edition
-                     "EMIT_BUNDLE_STATS" (or (env/env :emit-bundle-stats) "false")
-                     "INSTRUMENT_COVERAGE" (or (env/env :instrument-coverage) "false")}}
-              "bun" "run" "build-release"))
+        (u/sh {:dir u/project-root-directory, :env env} "bun" "run" "build-release:js"))
       (u/step "Build static viz"
         (u/sh {:dir u/project-root-directory
                :env {"PATH"       (env/env :path)
@@ -69,6 +76,9 @@
       (u/sh {:dir u/project-root-directory}
             "bun" "run" "generate-license-disclaimer"))))
 
+(defn- build-translations! []
+  (u/sh {:dir u/project-root-directory} "bin/i18n/build-translation-resources"))
+
 (defn- build-uberjar!
   "Build the uberjar. If `basis` is passed, the sources were already compiled in the background (see
   [[start-background-compile!]]), so only package them."
@@ -88,9 +98,9 @@
    :version      (fn [{:keys [edition version]}]
                    (version-properties/generate-version-properties-file! edition version))
    :translations (fn [_]
-                   (u/sh {:dir u/project-root-directory} "bin/i18n/build-translation-resources"))
-   :frontend     (fn [{:keys [edition]}]
-                   (build-frontend! edition))
+                   (build-translations!))
+   :frontend     (fn [{:keys [edition before-js]}]
+                   (build-frontend! edition {:before-js before-js}))
    :licenses     (fn [{:keys [edition]}]
                    (build-licenses! edition))
    #_#_:drivers      (fn [{:keys [edition]}]
@@ -165,6 +175,34 @@
                            #(print-background-compile-output! compile))
         basis))))
 
+(defn- start-background-translations!
+  "Build the translations on another thread, so the ClojureScript build doesn't wait for them, and call `then` once
+  they are built. Their output is held back until [[await-background-translations!]]."
+  [then]
+  (let [buffer (java.io.StringWriter.)]
+    {:buffer buffer
+     :result (future
+               (let [timer (u/start-timer)]
+                 (binding [*out* buffer]
+                   (build-translations!))
+                 (then)
+                 (u/since-ms timer)))}))
+
+(defn- await-background-translations!
+  "Wait for the translations started by [[start-background-translations!]] and print their output. A failure rethrows,
+  and its message carries the command's output."
+  [{:keys [buffer result]}]
+  (let [waiting-since (u/start-timer)
+        ran-ms        (try
+                        @result
+                        (catch java.util.concurrent.ExecutionException e
+                          (throw (or (.getCause e) e))))]
+    (u/announce "Translations ran in the background in %d ms; the frontend waited %d ms for them."
+                ran-ms (u/since-ms waiting-since))
+    (locking println
+      (print (str buffer))
+      (flush))))
+
 (defn build!
   "Programmatic entrypoint."
   ([]
@@ -179,8 +217,14 @@
          ;; AOT compilation doesn't need the frontend, so it starts with the frontend step and `:uberjar` waits for it.
          ;; Not any earlier: `:translations` rewrites `resources/locales.clj`, which the compile reads while it looks for
          ;; namespaces, and a half-written file fails the build.
-         background-compile (when (every? (set (map u/parse-as-keyword steps)) [:frontend :uberjar])
-                              (delay (start-background-compile! edition)))]
+         step-set           (set (map u/parse-as-keyword steps))
+         background-compile (when (every? step-set [:frontend :uberjar])
+                              (delay (start-background-compile! edition)))
+         ;; Only the JavaScript build reads the translations, so the ClojureScript build doesn't wait for them. The
+         ;; compile starts once they are done, for the reason above.
+         background-translations (when (every? step-set [:translations :frontend])
+                                   (delay (start-background-translations!
+                                           #(some-> background-compile force))))]
      (u/step (format "Running build steps for %s version %s: %s"
                      (case edition
                        :oss "Community (OSS) Edition"
@@ -194,11 +238,22 @@
                                                        :valid-steps (keys all-steps)})))]]
          (let [step  (u/parse-as-keyword step-name)
                basis (case step
-                       :frontend (do (some-> background-compile force) nil)
+                       :frontend (do (when-not background-translations
+                                       (some-> background-compile force))
+                                     nil)
                        :uberjar  (some-> background-compile force await-background-compile!)
                        nil)]
            (do-with-log-group (name step-name)
-                              #(step-fn {:version version, :edition edition, :basis basis})))
+                              #(if (and (= step :translations) background-translations)
+                                 (do (force background-translations)
+                                     (u/announce "Building translations in the background."))
+                                 (step-fn {:version   version
+                                           :edition   edition
+                                           :basis     basis
+                                           :before-js (when background-translations
+                                                        (fn []
+                                                          (await-background-translations! (force background-translations))
+                                                          (some-> background-compile force)))}))))
          (u/announce "Did %s in %d ms." step-name (u/since-ms timer)))
        (u/announce "All build steps finished.")))))
 
