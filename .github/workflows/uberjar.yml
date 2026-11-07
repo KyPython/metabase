@@ -90,9 +90,7 @@ jobs:
     needs: [setup]
     if: ${{ needs.setup.outputs.build_editions != '[]' }}
     name: build (${{ matrix.edition }})
-    # The build is CPU-bound: the frontend bundles and the background AOT compile compete for every core, so twice
-    # the cores take about half the time for about the same cost.
-    runs-on: ubuntu-latest-8-cores
+    runs-on: ${{ vars.DEFAULT_RUNNER_KEY }}
     timeout-minutes: 20
     strategy:
       matrix:
