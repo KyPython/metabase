@@ -203,6 +203,22 @@
       (print (str buffer))
       (flush))))
 
+(defn- github-actions? []
+  (= (System/getenv "GITHUB_ACTIONS") "true"))
+
+(defn- do-with-log-group
+  "Run `thunk`, wrapping its output in a collapsible GitHub Actions log group named `title` when running on GitHub
+  Actions. GitHub Actions doesn't support nested groups, so only use this for top-level build steps."
+  [title thunk]
+  (if-not (github-actions?)
+    (thunk)
+    ;; Workflow commands must start at the beginning of the line, so don't use `u/safe-println`, which indents.
+    (do (locking println (println (str "::group::" title)))
+        (try
+          (thunk)
+          (finally
+            (locking println (println "::endgroup::")))))))
+
 (defn build!
   "Programmatic entrypoint."
   ([]
