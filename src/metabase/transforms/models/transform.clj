@@ -12,6 +12,7 @@
    [metabase.models.interface :as mi]
    [metabase.permissions.core :as perms]
    [metabase.premium-features.core :refer [defenterprise]]
+   [metabase.remote-sync.core :as remote-sync]
    [metabase.search.core :as search.core]
    [metabase.search.spec :as search.spec]
    [metabase.serialization.core :as serialization]
@@ -25,6 +26,7 @@
    [metabase.transforms.util :as transforms.u]
    [metabase.util :as u]
    [metabase.util.honey-sql-2 :as h2x]
+   [metabase.util.i18n :refer [tru]]
    [metabase.util.log :as log]
    [metabase.util.malli :as mu]
    [metabase.util.malli.registry :as mr]
@@ -85,6 +87,14 @@
                  (transform-database-permissions? instance)
                  (native-transform-write-allowed? instance (:source_database_id instance)))))))
 
+(defn- transform-deletable?
+  "Whether the current user can write `instance` as a whole, which nobody can when a read-only instance syncs it."
+  ([instance]
+   (transform-deletable? instance nil))
+  ([instance models-cache]
+   (and (remote-sync/can-write? :model/Transform (:id instance))
+        (transform-writable? instance models-cache))))
+
 (defmethod mi/can-read? :model/Transform
   ([instance]
    (transform-readable? instance))
@@ -94,7 +104,7 @@
 
 (defmethod mi/can-write? :model/Transform
   ([instance]
-   (transform-writable? instance))
+   (transform-deletable? instance))
   ([_model pk]
    (when-let [transform (transforms.db/transform pk)]
      (mi/can-write? transform))))
@@ -108,15 +118,18 @@
 
 (defmethod mi/can-update? :model/Transform
   [instance changes]
-  (and (mi/can-write? instance)
-       (mi/can-write? (merge instance changes))))
+  (and (transform-writable? instance)
+       (transform-writable? (merge instance changes))
+       (or (not (remote-sync/synced-changes? :model/Transform instance changes))
+           (remote-sync/can-write? :model/Transform (:id instance)))))
 
 (defmethod mi/can-create? :model/Transform
   [_model instance]
   ;; Inline can-write? logic since instance is a plain map without model metadata.
   ;; can-write? requires: can-read? and has-db-transforms-permission?
   ;; can-read? requires: is-superuser? OR (entitled-data-analyst? AND source-tables-readable?)
-  (and (transforms.u/check-feature-enabled (transforms.u/->definition instance))
+  (and (not (remote-sync/read-only?))
+       (transforms.u/check-feature-enabled (transforms.u/->definition instance))
        (or api/*is-superuser?*
            (let [source-db-id (or (:source_database_id instance) (transforms-base.i/source-db-id instance))]
              (and (api/entitled-data-analyst?)
@@ -148,9 +161,19 @@
   [_]
   #{:transforms})
 
+(defn- check-no-card-tags
+  "Throws a 400 when the native query of `source` references a card in a template tag."
+  [{:keys [query]}]
+  (when query
+    (let [query (lib-be/normalize-query query)]
+      (when (and (lib/any-native-stage? query)
+                 (some :card-id (lib/all-template-tags query)))
+        (throw (ex-info (tru "A transform''s query can''t reference a card.") {:status-code 400}))))))
+
 (t2/define-before-insert :model/Transform
   [transform]
   (let [{:keys [source collection_id source_database_id]} transform]
+    (check-no-card-tags source)
     (collection/check-collection-namespace :model/Transform collection_id)
     (when collection_id
       (collection/check-allowed-content :model/Transform collection_id))
@@ -185,6 +208,8 @@
 (t2/define-before-update :model/Transform
   [transform]
   (let [{:keys [source source_database_id]} transform]
+    (when (contains? (t2/changes transform) :source)
+      (check-no-card-tags source))
     (when-let [new-collection (:collection_id (t2/changes transform))]
       (collection/check-collection-namespace :model/Transform new-collection)
       (collection/check-allowed-content :model/Transform new-collection))
@@ -251,7 +276,7 @@
 (methodical/defmethod t2/batched-hydrate [:model/Transform :can_write]
   "Add can_write to transforms."
   [_model k transforms]
-  (hydrate-permission k transforms transform-writable?))
+  (hydrate-permission k transforms transform-deletable?))
 
 (methodical/defmethod t2/batched-hydrate [:model/Transform :can_execute]
   "Add can_execute to transforms. Executing a transform requires write permission."
@@ -610,3 +635,7 @@
       (log/warnf "Skipping transform %s, since an export from before 66 left it without its deleted source database"
                  entity_id))
     (vec resolved)))
+
+(defmethod remote-sync/spec :model/Transform
+  [_model]
+  {})

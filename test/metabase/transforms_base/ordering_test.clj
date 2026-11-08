@@ -186,17 +186,18 @@
   (mt/test-drivers (mt/normal-driver-select {:+features [:transforms/table
                                                          :native-parameter-card-reference
                                                          :left-join]})
-    (mt/with-temp [:model/Card {card :id} {:dataset_query (orders-products-query)}
-                   :model/Transform {t1 :id} (make-transform
-                                              (-> (native-query (mt/native-query-with-card-template-tag (:engine (mt/db)) (str "#" card)))
-                                                  (lib/with-template-tags {(str "#" card) {:type         :card
-                                                                                           :name         (str "#" card)
-                                                                                           :display-name (str "#" card)
-                                                                                           :card-id      card
-                                                                                           :id           (str (random-uuid))}})))]
-      (is (= #{{:table (mt/id :orders)}
-               {:table (mt/id :products)}}
-             (transform-deps-for-db (t2/select-one :model/Transform :id t1)))))))
+    (testing "native transform referencing card depends on tables of card"
+      (mt/with-temp [:model/Card {card :id} {:dataset_query (orders-products-query)}]
+        (is (= #{{:table (mt/id :orders)}
+                 {:table (mt/id :products)}}
+               (transform-deps-for-db
+                (make-transform
+                 (-> (native-query (mt/native-query-with-card-template-tag (:engine (mt/db)) (str "#" card)))
+                     (lib/with-template-tags {(str "#" card) {:type         :card
+                                                              :name         (str "#" card)
+                                                              :display-name (str "#" card)
+                                                              :card-id      card
+                                                              :id           (str (random-uuid))}}))))))))))
 
 (defn- rotations
   [v]

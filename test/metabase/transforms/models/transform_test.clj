@@ -148,6 +148,27 @@
               (t2/delete! :model/Transform :id transform-id)))
           (is (empty? @events-published)))))))
 
+(deftest native-query-card-tags-test
+  (mt/with-temp [:model/Card {card-id :id} {:dataset_query (lib/query (mt/metadata-provider) (lib.metadata/table (mt/metadata-provider) (mt/id :venues)))}]
+    (let [mp       (mt/metadata-provider)
+          card-sql (str "SELECT * FROM {{#" card-id "}}")
+          source   (fn [query] {:type :query, :query query})
+          row      (fn [transform-name query]
+                     (assoc (mt/with-temp-defaults :model/Transform) :name transform-name :source (source query)))]
+      (testing "native query referencing card is rejected on insert and on source update"
+        (is (thrown-with-msg? clojure.lang.ExceptionInfo #"can't reference a card"
+                              (t2/insert! :model/Transform (row "Card tag" (lib/native-query mp card-sql)))))
+        (mt/with-temp [:model/Transform {transform-id :id} {:name "Plain" :source (source (lib/native-query mp "SELECT 1"))}]
+          (is (thrown-with-msg? clojure.lang.ExceptionInfo #"can't reference a card"
+                                (t2/update! :model/Transform :id transform-id {:source (source (lib/native-query mp card-sql))})))))
+      (testing "MBQL query on card is allowed"
+        (mt/with-temp [:model/Transform {transform-id :id} {:name "MBQL" :source (source (lib/query mp (lib.metadata/card mp card-id)))}]
+          (is (pos-int? transform-id))))
+      (testing "load is checked too"
+        (binding [mi/*deserializing?* true]
+          (is (thrown-with-msg? clojure.lang.ExceptionInfo #"can't reference a card"
+                                (t2/insert! :model/Transform (row "Loaded" (lib/native-query mp card-sql))))))))))
+
 (defn- stored-deps [transform-id]
   (t2/select-one-fn :table_dependencies :model/Transform :id transform-id))
 
@@ -304,14 +325,7 @@
                       :model/Transform transform
                       {:name   "Reads a Card"
                        :source {:type  :query
-                                :query (lib/with-template-tags
-                                         (lib/native-query (mt/metadata-provider) (format "SELECT * FROM {{#%d}} AS c" card-id))
-                                         {(str "#" card-id)
-                                          {:id           (str "#" card-id)
-                                           :name         (str "#" card-id)
-                                           :display-name (str "#" card-id)
-                                           :type         :card
-                                           :card-id      card-id}})}}]
+                                :query (lib/query (mt/metadata-provider) (lib.metadata/card (mt/metadata-provider) card-id))}}]
          (mt/with-non-admin-groups-no-collection-perms collection
            (let [stored (t2/select-one :model/Transform :id (:id transform))
                  body   (into {} stored)]

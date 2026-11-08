@@ -925,58 +925,41 @@
   (testing "GET /api/ee/dependencies/graph/dependents returns the actions a user can read"
     (mt/with-premium-features #{:dependencies}
       (mt/with-non-admin-groups-no-root-collection-perms
-        (mt/with-temp [:model/Collection readable-collection   {}
-                       :model/Collection unreadable-collection {:namespace "data-actions"}
-                       :model/Card {model-id :id} (assoc (basic-card "Venues model" :venues)
-                                                         :type          :model
-                                                         :collection_id (:id readable-collection))
-                       :model/Action {readable-id :id} {:type     :implicit
-                                                        :name     "Create venue"
-                                                        :model_id model-id}
-                       :model/ImplicitAction _ {:action_id readable-id, :kind "row/create"}
-                       :model/Action {unreadable-id :id} {:type          :query
-                                                          :name          "Delete venue"
-                                                          :collection_id (:id unreadable-collection)}
-                       :model/Action {root-id :id} {:type :query
-                                                    :name "Archive venue"}
-                       :model/QueryAction _ {:action_id     root-id
-                                             :database_id   (mt/id)
-                                             :dataset_query (-> (lib/native-query (mt/metadata-provider)
-                                                                                  (str "DELETE FROM venues WHERE id IN "
-                                                                                       "(SELECT id FROM {{#" model-id "}})"))
-                                                                (lib/with-template-tags
-                                                                  {(str "#" model-id) {:id           "model-tag"
-                                                                                       :type         :card
-                                                                                       :name         (str "#" model-id)
-                                                                                       :display-name "Venues model"
-                                                                                       :card-id      model-id}}))}
-                       :model/QueryAction _ {:action_id     unreadable-id
-                                             :database_id   (mt/id)
-                                             :dataset_query (-> (lib/native-query (mt/metadata-provider)
-                                                                                  (str "DELETE FROM venues WHERE id IN "
-                                                                                       "(SELECT id FROM {{#" model-id "}})"))
-                                                                (lib/with-template-tags
-                                                                  {(str "#" model-id) {:id           "model-tag"
-                                                                                       :type         :card
-                                                                                       :name         (str "#" model-id)
-                                                                                       :display-name "Venues model"
-                                                                                       :card-id      model-id}}))}]
-          (mt/with-model-cleanup [:model/Dependency :model/DependencyStatus]
-            (perms/grant-collection-read-permissions! (perms/all-users-group) readable-collection)
-            (deps.test/synchronously-run-dependency-job!)
-            (let [dependents (fn [user]
-                               (->> (mt/user-http-request user :get 200 "ee/dependencies/graph/dependents"
-                                                          :id model-id
-                                                          :type "card"
-                                                          :dependent-types "action")
-                                    (map (juxt :type :id (comp :name :data) (comp (juxt :name :namespace) :collection :data)))
-                                    set))]
-              (is (= #{["action" readable-id "Create venue" [(:name readable-collection) nil]]
-                       ["action" unreadable-id "Delete venue" [(:name unreadable-collection) "data-actions"]]
-                       ["action" root-id "Archive venue" ["Data actions" "data-actions"]]}
-                     (dependents :crowberto)))
-              (is (= #{["action" readable-id "Create venue" [(:name readable-collection) nil]]}
-                     (dependents :rasta))))))))))
+        (let [query (lib/native-query (mt/metadata-provider) "DELETE FROM venues WHERE id = 1")]
+          (mt/with-temp [:model/Collection readable-collection   {}
+                         :model/Collection unreadable-collection {:namespace "data-actions"}
+                         :model/Card {model-id :id} (assoc (basic-card "Venues model" :venues)
+                                                           :type          :model
+                                                           :collection_id (:id readable-collection))
+                         :model/Action {readable-id :id} {:type     :query
+                                                          :name     "Delete venue from model"
+                                                          :model_id model-id}
+                         :model/QueryAction _ {:action_id readable-id, :database_id (mt/id), :dataset_query query}
+                         :model/Action {unreadable-id :id} {:type          :query
+                                                            :name          "Delete venue"
+                                                            :collection_id (:id unreadable-collection)}
+                         :model/QueryAction _ {:action_id unreadable-id, :database_id (mt/id), :dataset_query query}
+                         :model/Action {root-id :id} {:type :query
+                                                      :name "Archive venue"}
+                         :model/QueryAction _ {:action_id root-id, :database_id (mt/id), :dataset_query query}]
+            (mt/with-model-cleanup [:model/Dependency :model/DependencyStatus]
+              (perms/grant-collection-read-permissions! (perms/all-users-group) readable-collection)
+              (deps.test/synchronously-run-dependency-job!)
+              (let [ours       #{readable-id unreadable-id root-id}
+                    dependents (fn [user]
+                                 (->> (mt/user-http-request user :get 200 "ee/dependencies/graph/dependents"
+                                                            :id (mt/id :venues)
+                                                            :type "table"
+                                                            :dependent-types "action")
+                                      (filter (comp ours :id))
+                                      (map (juxt :type :id (comp :name :data) (comp (juxt :name :namespace) :collection :data)))
+                                      set))]
+                (is (= #{["action" readable-id "Delete venue from model" [(:name readable-collection) nil]]
+                         ["action" unreadable-id "Delete venue" [(:name unreadable-collection) "data-actions"]]
+                         ["action" root-id "Archive venue" ["Data actions" "data-actions"]]}
+                       (dependents :crowberto)))
+                (is (= #{["action" readable-id "Delete venue from model" [(:name readable-collection) nil]]}
+                       (dependents :rasta)))))))))))
 
 (deftest implicit-action-table-change-moves-its-dependency-test
   (testing "changing the table of an implicit action without a model moves its dependency to the new table"
